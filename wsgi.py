@@ -54,8 +54,14 @@ def run_inference(version: str):
     image_bytes = request.files['image'].read() # byte file
     npimg = np.frombuffer(image_bytes, np.uint8) # convert bytes into a numpy array
     img : Image = cv2.imdecode(npimg, cv2.IMREAD_COLOR) # converts into format that opencv can process
+    
+    print(f"image:")
+    print(img)
 
-    depth_map = metric3d_inference.estimate_depth(version, org_rgb=img, focal_length_px=focal_length)
+    depth_map = metric3d_inference.estimate_depth(version, org_rgb=img, focal_length_px=float(focal_length))
+    
+    print(f"depth:")
+    print(depth_map)
     
     # Save depth map to a binary buffer
     buffer = io.BytesIO()

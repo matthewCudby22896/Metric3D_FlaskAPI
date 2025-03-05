@@ -4,6 +4,14 @@ import numpy as np
 import cv2
 import time
 import logging
+from mono.model.monodepth_model import get_configured_monodepth_model, get_monodepth_model
+from mono.utils.running import load_ckpt
+
+
+try:
+    from mmcv.utils import Config, DictAction
+except:
+    from mmengine import Config, DictAction
 
 Image = np.ndarray
 
@@ -14,6 +22,21 @@ MODEL_VERSIONS = {
     'large' : 'metric3d_vit_large',
     'giant' : 'metric3d_vit_giant2',
 }
+
+MODEL_WEIGHTS = {
+    'small' : "weight/metric_depth_vit_small_800k.pth",
+    'large' : "weight/metric_depth_vit_large_800k.pth",
+    'giant' : "weight/metric_depth_vit_giant2_800k.pth",
+}
+
+MODEL_CFG = {
+    'small' : "mono/configs/HourglassDecoder/vit.raft5.small.py",
+    'large' : "mono/configs/HourglassDecoder/vit.raft5.large.py",
+    'giant' : "mono/configs/HourglassDecoder/vit.raft5.giant2.py",
+}
+
+large_weights = "weight/metric_depth_vit_large_800k.pth"
+large_cfg = 'mono/configs/HourglassDecoder/vit.raft5.small.py'
 
 TORCH_HUB_USER = 'yvanyin/metric3d'
 
@@ -26,19 +49,42 @@ models = {}
 if not torch.cuda.is_available():
     raise Exception(f"cuda not available!")
 
-def _get_model(version : str):
+def get_model(version: str):
     if version not in MODEL_VERSIONS:
-        raise ValueError(f"Unkown version: {version}")
+        raise ValueError(f"Unknown version: {version}")
     
     if version not in models:
-        logger.info(f"loading model...")
-        models[version] = torch.hub.load(TORCH_HUB_USER, MODEL_VERSIONS[version], pretrain=True)
+        logger.info(f"Loading {version} model...")
+        
+        # Load configuration
+        cfg = Config.fromfile(MODEL_CFG[version])
+        
+        # Initialize model
+        model = get_configured_monodepth_model(cfg, )
+        
+        # Wrap in DataParallel as load_ckpt expects this
+        model = torch.nn.DataParallel(model).cuda()
+    
+        load_from = MODEL_WEIGHTS[version]
+        
+        # Load checkpoint
+        model, _,  _, _ = load_ckpt(load_from, model, strict_match=False)
+        
+        logger.info(f"checkpoint succesfully loaded from {load_from}")
+        
+        # Move to GPU and set to eval mode
+        model.to("cuda" if torch.cuda.is_available() else "cpu")
+        model.eval()
+        
+        models[version] = model
     
     return models[version]
 
-
 def estimate_depth(version : str, org_rgb : Image, focal_length_px : float) -> np.ndarray:
-    model : torch.nn.Module = _get_model(version)
+    model : torch.nn.Module = get_model(version)
+    
+    print(type(focal_length_px))
+    print(focal_length_px)
         
     logger.info(f"{org_rgb.shape=}")
     
@@ -71,7 +117,7 @@ def estimate_depth(version : str, org_rgb : Image, focal_length_px : float) -> n
     model.cuda().eval()
     with torch.no_grad():
         s = time.time()
-        pred_depth, confidence, output_dict = model.inference({'input' : rgb})
+        pred_depth, confidence, output_dict = model.module.inference({'input' : rgb})
         e = time.time()
         logger.info(f"Model inference took {e - s} seconds\n\t{version=}\n\t{focal_length_px=}")
     
@@ -89,66 +135,8 @@ def estimate_depth(version : str, org_rgb : Image, focal_length_px : float) -> n
     pred_depth = pred_depth * canonical_to_real_scale # now the depth is metric
     pred_depth = torch.clamp(pred_depth, 0, 300)
     
-    pred_depth_np = pred_depth.numpy()
+    pred_depth_np = pred_depth.cpu().numpy()
     
     assert pred_depth_np.shape == org_rgb.shape[0:2]
     
     return pred_depth_np
-
-
-# class metric3d_inference_generator:
-#     def __init__(self):
-#         self.model_small = None
-#         self.model_large = None
-#         self.model_giant = None
-#         self.models = {}
-#         self.input_size = (616, 1064)
-        
-#         if not torch.cuda.is_available(): 
-#             raise Exception("CUDA is not available")
-
-#     def _get_model(self, version : str):
-#         if version not in MODEL_VERSIONS:
-#             raise ValueError(f"Unkown version: {version}")
-        
-#         if version not in self.models:
-#             self.models[version] = torch.hub.load(TORCH_HUB_USER, MODEL_VERSIONS[version], pretrain=True)
-        
-#         return self.models[version]
-    
-#     def estimate_depth(self, org_rgb: np.ndarray, version : str) -> np.ndarray:
-#         model = self._get_model(version)
-        
-#         # rescale the image
-#         h, w = org_rgb.shape[:2]
-#         scale = min(self.input_size[0] / h, self.input_size[1] / w)
-#         rgb = cv2.resize(org_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-        
-#         # add padding
-#         h, w = rgb.shape[:2]
-#         pad_h, pad_w = self.input_size[0] - h, self.input_size[1] - w
-#         pad_h_half, pad_w_half = pad_h // 2, pad_w // 2
-#         pad_info = [pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half]
-        
-#         rgb = cv2.copyMakeBorder(rgb, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=PADDING_CLR)
-        
-#         # normalise 
-#         mean = torch.tensor([123.675, 116.28, 103.53]).float()[:, None, None]
-#         std = torch.tensor([58.395, 57.12, 57.375]).float()[:, None, None]
-#         rgb = torch.from_numpy(rgb.transpose((2, 0, 1))).float()
-#         rgb = torch.div((rgb - mean), std)
-#         rgb = rgb[None, :, :, :].cuda()
-        
-#         # forward propogatrion
-#         with torch.no_grad():
-#             pred_depth, _, _ = model({'input' : rgb})
-        
-#         # remove padding
-#         pred_depth = pred_depth.squeeze()
-#         pred_depth = pred_depth[pad_info[0] : pred_depth.shape[0] - pad_info[1], pad_info[2] : pred_depth.shape[1] - pad_info[3]]
-        
-#         # upsample to original size
-#         pred_depth = torch.nn.functional.interpolate(pred_depth[None, None, :, :], org_rgb.shape[:2], mode='bilinear').squeeze()
-#         pred_depth = pred_depth.cpu().numpy()
-        
-#         return pred_depth
